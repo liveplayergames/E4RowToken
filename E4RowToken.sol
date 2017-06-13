@@ -1,15 +1,85 @@
-// VERSION M(A)
+pragma solidity ^0.4.11;
 
-pragma solidity ^0.4.8;
+// VERSION LAVA(C)
 
-
+// --------------------------
+// here's how this works:
+// the current amount of dividends due to each token-holder's  is:
+//   previous_due + [ p(x) * t(x)/N ] + [ p(x+1) * t(x+1)/N ] + ...
+//   where p(x) is the x'th payment received by the contract
+//         t(x) is the number of tokens held by the token-holder at the time of p(x)
+//         N    is the total number of tokens, which never changes
 //
-// FOR REFERENCE - INCLUDE  iE4RowEscrow  (interface) CONTRACT at the top .....
+// assume that t(x) takes on 3 values, t(a), t(b) and t(c), during periods a, b, and c. then:
+// factoring:
+//   current_due = { (t(a) * [p(x) + p(x+1)] ...) +
+//                   (t(b) * [p(y) + p(y+1)] ...) +
+//                   (t(c) * [p(z) + p(z+1)] ...) } / N
 //
-
-contract iE4RowEscrow {
-	function getNumGamesStarted() constant returns (int ngames);
-}
+// or
+//
+//   current_due = { (t(a) * period_a_fees) +
+//                   (t(b) * period_b_fees) +
+//                   (t(c) * period_c_fees) } / N
+//
+// if we designate current_due * N as current-points, then
+//
+//   currentPoints = {  (t(a) * period_a_fees) +
+//                      (t(b) * period_b_fees) +
+//                      (t(c) * period_c_fees) }
+//
+// or more succictly, if we recompute current points before a token-holder's number of
+// tokens, T, is about to change:
+//
+//   currentPoints = previous_points + (T * current-period-fees)
+//
+// when we want to do a payout, we'll calculate:
+//  current_due = current-points / N
+//
+// we'll keep track of a token-holder's current-period-points, which is:
+//   T * current-period-fees
+// by taking a snapshot of fees collected exactly when the current period began; that is, the when the
+// number of tokens last changed. that is, we keep a running count of total fees received
+//
+//   TotalFeesReceived = p(x) + p(x+1) + p(x+2)
+//
+// (which happily is the same for all token holders) then, before any token holder changes their number of
+// tokens we compute (for that token holder):
+//
+//  function calcCurPointsForAcct(acct) {
+//    currentPoints[acct] += (TotalFeesReceived - lastSnapshot[acct]) * T[acct]
+//    lastSnapshot[acct] = TotalFeesReceived
+//  }
+//
+// in the withdraw fcn, all we need is:	
+//
+//  function withdraw(acct) {
+//    calcCurPointsForAcct(acct);
+//    current_amount_due = currentPoints[acct] / N
+//    currentPoints[acct] = 0;
+//    send(current_amount_due);
+//  }
+//
+//
+// special provisions for transfers from the old e4row contract (token-split transfers)
+// -------------------------------------------------------------------------------------
+// normally when a new acct is created, eg cuz tokens are transferred from one acct to another, we first call
+// calcCurPointsForAcct(acct) on the old acct; on the new acct we set:
+//  currentPoints[acct] = 0;
+//  lastSnapshot[acct] = TotalFeesReceived;
+//
+// this starts the new account with no credits for any dividends that have been collected so far, which is what
+// you would generally want. however, there is a case in which tokens are transferred from the old e4row contract.
+// in that case the tokens were reserved on this contract all along, and they earn dividends even before they are
+// assigned to an account. so for token-split transfers:
+//  currentPoints[acct] = 0;
+//  lastSnapshot[acct] = 0;
+//
+// then immediately call calcCurPointsForAcct(acct) for the new token-split account. he will get credit
+// for all the accumulated points, from the beginning of time.
+//
+// --------------------------
+	
 
 // Abstract contract for the full ERC 20 Token standard
 // https://github.com/ethereum/EIPs/issues/20
@@ -33,105 +103,84 @@ contract Token {
 // --------------------------
 //  E4RowRewards - abstract e4 dividend contract
 // --------------------------
-contract E4RowRewards
+contract E4LavaRewards
 {
 	function checkDividends(address _addr) constant returns(uint _amount);
 	function withdrawDividends() public returns (uint namount);
+	function transferDividends(address _to) returns (bool success);
+
 }
 
 // --------------------------
-//  Finney Chip - token contract
+//  E4ROW (LAVA) - token contract
 // --------------------------
-contract E4Token is Token, E4RowRewards {
+contract E4Lava is Token, E4LavaRewards {
     	event StatEvent(string msg);
     	event StatEventI(string msg, uint val);
 
-	enum SettingStateValue  {debug, release, lockedRelease}
-	enum IcoStatusValue {anouncement, saleOpen, saleClosed, failed, succeeded}
-
-
-
+	enum SettingStateValue  {debug, lockedRelease}
 
 	struct tokenAccount {
-		bool alloced; // flag to ascert prior allocation
-		uint tokens; // num tokens
-		uint balance; // rewards balance
+		bool alloced;       // flag to ascert prior allocation
+		uint tokens;        // num tokens currently held in this acct
+		uint currentPoints; // updated before token balance changes, or before a withdrawal. credit for owning tokens
+		uint lastSnapshot;  // snapshot of global TotalPoints, last time we updated this acct's currentPoints
 	}
+
 // -----------------------------
 //  data storage
 // ----------------------------------------
-	address developers; // developers token holding address
-	address public owner; // deployer executor
-	address founderOrg; // founder orginaization contract
-	address auxPartner; // aux partner (pr/auditing) - 1 percent upon close
-	address e4_partner; // e4row  contract addresses
+	uint constant NumOrigTokens         = 5762;   // number of old tokens, from original token contract
+	uint constant NewTokensPerOrigToken = 100000; // how many new tokens are created for each from original token
+	uint constant NewTokenSupply        = 5762 * 100000;
+	uint public numToksSwitchedOver;              // count old tokens that have been converted
+	uint public holdoverBalance;                  // funds received, but not yet distributed
+	uint public TotalFeesReceived;                // total fees received from partner contract(s)
 
+	address public developers;                    // developers token holding address
+	address public owner;                         // deployer executor
+	address public oldE4;			      // addr of old e4 token contract
+	address public oldE4RecycleBin;  // addr to transfer old tokens
 
-	mapping (address => tokenAccount) holderAccounts ; // who holds how many tokens (high two bytes contain curPayId)
-	mapping (uint => address) holderIndexes ; // for iteration thru holder
-	uint numAccounts;
+	uint public decimals;
+	string public symbol;
 
-	uint partnerCredits; // amount partner (e4row)  has paid
+	mapping (address => tokenAccount) holderAccounts;          // who holds how many tokens (high two bytes contain curPayId)
+	mapping (uint => address) holderIndexes;                   // for iteration thru holder
 	mapping (address => mapping (address => uint256)) allowed; // approvals
+	uint public numAccounts;
 
+	uint public payoutThreshold;                  // no withdrawals less than this amount, to avoid remainders
+	uint public vestTime; 		              // 1 year past sale vest developer tokens
+	uint public rwGas;                            // reward gas
+	uint public optInGas;
 
-	uint maxMintableTokens; // ...
-	uint minIcoTokenGoal;// token goal by sale end
-	uint minUsageGoal; //  num games goal by usage deadline
-	uint public  tokenPrice; // price per token
-	uint public payoutThreshold; // threshold till payout
-
-	uint totalTokenFundsReceived; 	// running total of token funds received
-	uint public totalTokensMinted; 	// total number of tokens minted
-	uint public holdoverBalance; 		// hold this amount until threshhold before reward payout
-	int public payoutBalance; 		// hold this amount until threshhold before reward payout
-	int prOrigPayoutBal;			// original payout balance before run
-	uint prOrigTokensMint; 			// tokens minted at start of pay run
-	uint public curPayoutId;		// current payout id
-	uint public lastPayoutIndex;		// payout idx between run segments
-	uint public maxPaysPer;			// num pays per segment
-	uint public minPayInterval;		// min interval between start pay run
-
-
-	uint fundingStart; 		// funding start time immediately after anouncement
-	uint fundingDeadline; 		// funding end time
-	uint usageDeadline; 		// deadline where minimum usage needs to be met before considered success
-	uint public lastPayoutTime; 	// timestamp of last payout time
-	uint vestTime; 		// 1 year past sale vest developer tokens
-	uint numDevTokens; 	// 10 per cent of tokens after close to developers
-	bool developersGranted; 		// flag
-	uint remunerationStage; 	// 0 for not yet, 1 for 10 percent, 2 for remaining  upon succeeded.
-	uint public remunerationBalance; 	// remuneration balance to release token funds
-	uint auxPartnerBalance; 	// aux partner balance - 1 percent
-	uint rmGas; // remuneration gas
-	uint rwGas; // reward gas
-	uint rfGas; // refund gas
-
-	IcoStatusValue icoStatus;  // current status of ico
 	SettingStateValue public settingsState;
 
 
 	// --------------------
 	// contract constructor
 	// --------------------
-	function E4Token() 
+	function E4Lava() 
 	{
 		owner = msg.sender;
 		developers = msg.sender;
+		decimals = 2;
+		symbol = "E4ROW";
 	}
 
 	// -----------------------------------
 	// use this to reset everything, will never be called after lockRelease
 	// -----------------------------------
-	function applySettings(SettingStateValue qState, uint _saleStart, uint _saleEnd, uint _usageEnd, uint _minUsage, uint _tokGoal, uint  _maxMintable, uint _threshold, uint _price, uint _mpp, uint _mpi )
+	function applySettings(SettingStateValue qState, uint _threshold, uint _vest, uint _rw, uint _optGas )
 	{
 		if (msg.sender != owner) 
 			return;
 
 		// these settings are permanently tweakable for performance adjustments
 		payoutThreshold = _threshold;
-		maxPaysPer = _mpp;
-		minPayInterval = _mpi;
+		rwGas = _rw;
+		optInGas = _optGas;
 
 		// this first test checks if already locked
 		if (settingsState == SettingStateValue.lockedRelease)
@@ -148,55 +197,24 @@ contract E4Token is Token, E4RowRewards {
 			return;
 		}
 
-		icoStatus = IcoStatusValue.anouncement;
-
-		rmGas = 100000; // remuneration gas
-		rwGas = 10000; // reward gas
-		rfGas = 10000; // refund gas
-
-
 		// zero out all token holders.  
 		// leave alloced on, leave num accounts
 		// cant delete them anyways
 	
-		if (totalTokensMinted > 0) {
-			for (uint i = 0; i < numAccounts; i++ ) {
-				address a = holderIndexes[i];
-				if (a != address(0)) {
-					holderAccounts[a].tokens = 0;
-					holderAccounts[a].balance = 0;
-				}
+		for (uint i = 0; i < numAccounts; i++ ) {
+			address a = holderIndexes[i];
+			if (a != address(0)) {
+				holderAccounts[a].tokens = 0;
+				holderAccounts[a].currentPoints = 0;
+				holderAccounts[a].lastSnapshot = 0;
 			}
 		}
-		// do not reset numAccounts!
 
-		totalTokensMinted = 0; // this will erase
-		totalTokenFundsReceived = 0; // this will erase.
-		partnerCredits = 0; // reset all partner credits
-
-		fundingStart =  _saleStart;
-		fundingDeadline = _saleEnd;
-		usageDeadline = _usageEnd;
-		minUsageGoal = _minUsage;
-		minIcoTokenGoal = _tokGoal;
-		maxMintableTokens = _maxMintable;
-		tokenPrice = _price;
-
-		vestTime = fundingStart + (365 days);
-		numDevTokens = 0;
-		
-		holdoverBalance = 0;
-		payoutBalance = 0;
-		curPayoutId = 1;
-		lastPayoutIndex = 0;
-		remunerationStage = 0;
-		remunerationBalance = 0;
-		auxPartnerBalance = 0;
-		developersGranted = false;
-		lastPayoutTime = 0;
+		vestTime = _vest;
+		numToksSwitchedOver = 0;
 
 		if (this.balance > 0) {
-			if (!owner.call.gas(rfGas).value(this.balance)())
+			if (!owner.call.gas(rwGas).value(this.balance)())
 				StatEvent("ERROR!");
 		}
 		StatEvent("ok");
@@ -205,28 +223,14 @@ contract E4Token is Token, E4RowRewards {
 
 
 	// ---------------------------------------------------
-	// tokens held reserve the top two bytes for the payid last paid.
-	// this is so holders at the top of the list dont transfer tokens 
-	// to themselves on the bottom of the list thus scamming the 
-	// system. this function deconstructs the tokenheld value.
-	// ---------------------------------------------------
-	function getPayIdAndHeld(uint _tokHeld) internal returns (uint _payId, uint _held)
-	{
-		_payId = (_tokHeld / (2 ** 48)) & 0xffff;
-		_held = _tokHeld & 0xffffffffffff;
-	}
-	function getHeld(uint _tokHeld) internal  returns (uint _held)
-	{
-		_held = _tokHeld & 0xffffffffffff;
-	}
-	// ---------------------------------------------------
 	// allocate a new account by setting alloc to true
-	// set the top to bytes of tokens to cur pay id to leave out of current round
 	// add holder index, bump the num accounts
 	// ---------------------------------------------------
 	function addAccount(address _addr) internal  {
 		holderAccounts[_addr].alloced = true;
-		holderAccounts[_addr].tokens = (curPayoutId * (2 ** 48));
+		holderAccounts[_addr].tokens = 0;
+		holderAccounts[_addr].currentPoints = 0;
+		holderAccounts[_addr].lastSnapshot = TotalFeesReceived;
 		holderIndexes[numAccounts++] = _addr;
 	}
 	
@@ -234,74 +238,68 @@ contract E4Token is Token, E4RowRewards {
 // --------------------------------------
 // BEGIN ERC-20 from StandardToken
 // --------------------------------------
+
 	function totalSupply() constant returns (uint256 supply)
 	{
-		if (icoStatus == IcoStatusValue.saleOpen
-			|| icoStatus == IcoStatusValue.anouncement)
-			supply = maxMintableTokens;
-		else
-			supply = totalTokensMinted;
+		supply = NewTokenSupply;
 	}
 
-	function transfer(address _to, uint256 _value) returns (bool success) {
-
+	// ----------------------------
+	// sender transfers tokens to a new acct
+	// do not use this fcn for a token-split transfer from the old token contract!
+	// ----------------------------
+	function transfer(address _to, uint256 _value) returns (bool success) 
+	{
 		if ((msg.sender == developers) 
 			&&  (now < vestTime)) {
 			//statEvent("Tokens not yet vested.");
 			return false;
 		}
 
-
 	        //Default assumes totalSupply can't be over max (2^256 - 1).
 	        //If your token leaves out totalSupply and can issue more tokens as time goes on, you need to check if it doesn't wrap.
 	        //Replace the if with this one instead.
-	        //if (holderAccounts[msg.sender] >= _value && balances[_to] + _value > holderAccounts[_to]) {
-
-		var (pidFrom, heldFrom) = getPayIdAndHeld(holderAccounts[msg.sender].tokens);
-	        if (heldFrom >= _value && _value > 0) {
-
+	        //if (holderAccounts[msg.sender].tokens >= _value && balances[_to] + _value > holderAccounts[_to]) {
+	        if (holderAccounts[msg.sender].tokens >= _value && _value > 0) {
+		    //first credit sender with points accrued so far.. must do this before number of held tokens changes
+		    calcCurPointsForAcct(msg.sender);
 	            holderAccounts[msg.sender].tokens -= _value;
-
+		    
 		    if (!holderAccounts[_to].alloced) {
 			addAccount(_to);
 		    }
-
-		    uint newHeld = _value + getHeld(holderAccounts[_to].tokens);
-		    if (icoStatus == IcoStatusValue.saleOpen) // avoid mcgees gambit
-		    	pidFrom = curPayoutId;
-		    holderAccounts[_to].tokens = newHeld | (pidFrom * (2 ** 48));
+		    //credit destination acct with points accrued so far.. must do this before number of held tokens changes
+		    calcCurPointsForAcct(_to);
+		    holderAccounts[_to].tokens += _value;
 
 	            Transfer(msg.sender, _to, _value);
 	            return true;
 	        } else { 
-			return false; 
+		    return false; 
 		}
     	}
 
-    	function transferFrom(address _from, address _to, uint256 _value) returns (bool success) {
 
+    	function transferFrom(address _from, address _to, uint256 _value) returns (bool success) {
 		if ((_from == developers) 
 			&&  (now < vestTime)) {
 			//statEvent("Tokens not yet vested.");
 			return false;
 		}
 
+		//same as above. Replace this line with the following if you want to protect against wrapping uints.
+		//if (holderAccounts[_from].tokens >= _value && allowed[_from][msg.sender] >= _value && holderAccounts[_to].tokens + _value > holderAccounts[_to].tokens) {
+        	if (holderAccounts[_from].tokens >= _value && allowed[_from][msg.sender] >= _value && _value > 0) {
 
-        //same as above. Replace this line with the following if you want to protect against wrapping uints.
-        //if (balances[_from] >= _value && allowed[_from][msg.sender] >= _value && balances[_to] + _value > balances[_to]) {
-
-		var (pidFrom, heldFrom) = getPayIdAndHeld(holderAccounts[_from].tokens);
-        	if (heldFrom >= _value && allowed[_from][msg.sender] >= _value && _value > 0) {
+		    calcCurPointsForAcct(_from);
 	            holderAccounts[_from].tokens -= _value;
-
-		    if (!holderAccounts[_to].alloced)
+		    
+		    if (!holderAccounts[_to].alloced) {
 			addAccount(_to);
-
-		    uint newHeld = _value + getHeld(holderAccounts[_to].tokens);
-
-		    if (icoStatus == IcoStatusValue.saleOpen) // avoid mcgees gambit
-		    	pidFrom = curPayoutId;
-		    holderAccounts[_to].tokens = newHeld | (pidFrom * (2 ** 48));
+		    }
+		    //credit destination acct with points accrued so far.. must do this before number of held tokens changes
+		    calcCurPointsForAcct(_to);
+		    holderAccounts[_to].tokens += _value;
 
 	            allowed[_from][msg.sender] -= _value;
 	            Transfer(_from, _to, _value);
@@ -313,10 +311,7 @@ contract E4Token is Token, E4RowRewards {
 
 
     	function balanceOf(address _owner) constant returns (uint256 balance) {
-		// vars default to 0
-		if (holderAccounts[_owner].alloced) {
-	        	balance = getHeld(holderAccounts[_owner].tokens);
-		} 
+        	balance = holderAccounts[_owner].tokens;
     	}
 
     	function approve(address _spender, uint256 _value) returns (bool success) {
@@ -332,429 +327,129 @@ contract E4Token is Token, E4RowRewards {
 // END ERC20
 // ----------------------------------
 
-  
-
-
-
-	// -------------------------------------------
-	// default payable function.
-	// if sender is e4row  partner, this is a rake fee payment
-	// otherwise this is a token purchase.
-	// tokens only purchaseable between tokenfundingstart and end
-	// -------------------------------------------
-	function () payable {
-		if (msg.sender == e4_partner) {
-		     feePayment(); // from e4row game escrow contract
-		} else {
-		     purchaseToken();
-		}
-	}
-
-	// -----------------------------
-	// purchase token function - tokens only sold during sale period up until the max tokens
-	// purchase price is tokenPrice.  all units in wei.
-	// purchaser will not be included in current pay run
-	// -----------------------------
-	function purchaseToken() payable {
-
-		uint nvalue = msg.value; // being careful to preserve msg.value
-		address npurchaser = msg.sender;
-		if (nvalue < tokenPrice) 
-			throw;
-
-		uint qty = nvalue/tokenPrice;
-		updateIcoStatus();
-		if (icoStatus != IcoStatusValue.saleOpen) // purchase is closed
-			throw;
-		if (totalTokensMinted + qty > maxMintableTokens)
-			throw;
-		if (!holderAccounts[npurchaser].alloced)
-			addAccount(npurchaser);
-		
-		// purchaser waits for next payrun. otherwise can disrupt cur pay run
-		uint newHeld = qty + getHeld(holderAccounts[npurchaser].tokens);
-		holderAccounts[npurchaser].tokens = newHeld | (curPayoutId * (2 ** 48));
-
-		totalTokensMinted += qty;
-		totalTokenFundsReceived += nvalue;
-
-		if (totalTokensMinted == maxMintableTokens) {
-			icoStatus = IcoStatusValue.saleClosed;
-			//test unnecessary -  if (getNumTokensPurchased() >= minIcoTokenGoal)
-			doDeveloperGrant();
-			StatEventI("Purchased,Granted", qty);
-		} else
-			StatEventI("Purchased", qty);
-
+	// ----------------------------
+	// calc current points for a token holder; that is, points that are due to this token holder for all dividends
+	// received by the contract during the current "period". the period began the last time this fcn was called, at which
+	// time we updated the account's snapshot of the running point count, TotalFeesReceived. during the period the account's
+	// number of tokens must not have changed. so always call this fcn before changing the number of tokens.
+	// ----------------------------
+	function calcCurPointsForAcct(address _acct) {
+     	      holderAccounts[_acct].currentPoints += (TotalFeesReceived - holderAccounts[_acct].lastSnapshot) * holderAccounts[_acct].tokens;
+	      holderAccounts[_acct].lastSnapshot = TotalFeesReceived;
 	}
 
 
 	// ---------------------------
-	// accept payment from e4row contract
+	// accept payment from a partner contract
+	// funds sent here are added to TotalFeesReceived
 	// WARNING! DO NOT CALL THIS FUNCTION LEST YOU LOSE YOUR MONEY
-	// HOWEVER ADD THIS GIFT TO THE HOLDOVERBALANCE
-	// YOU HAVE BEEN WARNED
 	// ---------------------------
-	function feePayment() payable  
-	{
-		if (msg.sender != e4_partner) {
-			if (msg.value > 0)
-				holdoverBalance += msg.value;
-			StatEvent("forbidden");
-			return; // thank you
-		}
-		uint nfvalue = msg.value; // preserve value in case changed in dev grant
-
-		updateIcoStatus();
-
-		holdoverBalance += nfvalue;
-		partnerCredits += nfvalue;
-		StatEventI("Payment", nfvalue);
-
-		if (holdoverBalance > payoutThreshold
-			|| payoutBalance > 0)
-			doPayout(maxPaysPer);
-		
-	
+	function () payable {
+		holdoverBalance += msg.value;
+		TotalFeesReceived += msg.value;
+		StatEventI("Payment", msg.value);
 	}
 
 	// ---------------------------
-	// set the e4row partner, this is only done once
+	// one never knows if this will come in handy.
 	// ---------------------------
-	function setE4RowPartner(address _addr) public	
-	{
-	// ONLY owner can set and ONLY ONCE! (unless "unlocked" debug)
-	// once its locked. ONLY ONCE!
-		if (msg.sender == owner) {
-			if ((e4_partner == address(0)) || (settingsState == SettingStateValue.debug)) {
-				e4_partner = _addr;
-				partnerCredits = 0;
-				//StatEventI("E4-Set", 0);
-			} else {
-				StatEvent("Already Set");
-			}
-		}
+	function () blackHole {
+		StatEventI("adjusted", msg.value);
 	}
-
-	// ----------------------------
-	// return the total tokens purchased
-	// ----------------------------
-	function getNumTokensPurchased() constant returns(uint _purchased)
-	{
-		_purchased = totalTokensMinted-numDevTokens;
-	}
-
-	// ----------------------------
-	// return the num games as reported from the e4row  contract
-	// ----------------------------
-	function getNumGames() constant returns(uint _games)
-	{
-		//_games = 0;
-		if (e4_partner != address(0)) {
-			iE4RowEscrow pe4 = iE4RowEscrow(e4_partner);
-			_games = uint(pe4.getNumGamesStarted());
-		} 
-		//else
-		//StatEvent("Empty E4");
-	}
-
-	// ------------------------------------------------
-	// get the founders, auxPartner, developer
-	// --------------------------------------------------
-	function getSpecialAddresses() constant returns (address _fndr, address _aux, address _dev, address _e4)
-	{
-		//if (_sender == owner) { // no msg.sender on constant functions at least in mew
-			_fndr = founderOrg;
-			_aux = auxPartner;
-			_dev = developers;
-			_e4  = e4_partner;
-		//}
-	}
-
-
-
-	// ----------------------------
-	// update the ico status
-	// ----------------------------
-	function updateIcoStatus() public
-	{
-		if (icoStatus == IcoStatusValue.succeeded 
-			|| icoStatus == IcoStatusValue.failed)
-			return;
-		else if (icoStatus == IcoStatusValue.anouncement) {
-			if (now > fundingStart && now <= fundingDeadline) {
-				icoStatus = IcoStatusValue.saleOpen;
-				
-			} else if (now > fundingDeadline) {
-				// should not be here - this will eventually fail
-				icoStatus = IcoStatusValue.saleClosed;
-			}
-		} else {
-			uint numP = getNumTokensPurchased();
-			uint numG = getNumGames();
-			if ((now > fundingDeadline && numP < minIcoTokenGoal)
-				|| (now > usageDeadline && numG < minUsageGoal)) {
-				icoStatus = IcoStatusValue.failed;
-			} else if ((now > fundingDeadline) // dont want to prevent more token sales
-				&& (numP >= minIcoTokenGoal)
-				&& (numG >= minUsageGoal)) {
-				icoStatus = IcoStatusValue.succeeded; // hooray
-			}
-			if (icoStatus == IcoStatusValue.saleOpen
-				&& ((numP >= maxMintableTokens)
-				|| (now > fundingDeadline))) {
-					icoStatus = IcoStatusValue.saleClosed;
-				}
-		}
-
-		if (!developersGranted
-			&& icoStatus != IcoStatusValue.saleOpen 
-			&& icoStatus != IcoStatusValue.anouncement
-			&& getNumTokensPurchased() >= minIcoTokenGoal) {
-				doDeveloperGrant(); // grant whenever status goes from open to anything...
-		}
-
-	
-	}
-
-	
-	// ----------------------------
-	// request refund. Caller must call to request and receive refund 
-	// WARNING - withdraw rewards/dividends before calling.
-	// YOU HAVE BEEN WARNED
-	// ----------------------------
-	function requestRefund()
-	{
-		address nrequester = msg.sender;
-		updateIcoStatus();
-
-		uint ntokens = getHeld(holderAccounts[nrequester].tokens);
-		if (icoStatus != IcoStatusValue.failed)
-			StatEvent("No Refund");
-		else if (ntokens == 0)
-			StatEvent("No Tokens");
-		else {
-			uint nrefund = ntokens * tokenPrice;
-			if (getNumTokensPurchased() >= minIcoTokenGoal)
-				nrefund -= (nrefund /10); // only 90 percent b/c 10 percent payout
-
-			if (!holderAccounts[developers].alloced) 
-				addAccount(developers);
-			holderAccounts[developers].tokens += ntokens;
-			holderAccounts[nrequester].tokens = 0;
-			if (holderAccounts[nrequester].balance > 0) {
-				// see above warning!!
-				holderAccounts[developers].balance += holderAccounts[nrequester].balance;
-				holderAccounts[nrequester].balance = 0;
-			}
-
-			if (!nrequester.call.gas(rfGas).value(nrefund)())
-				throw;
-			//StatEventI("Refunded", nrefund);
-		}
-	}
-
-
-
-	// ---------------------------------------------------
-	// payout rewards to all token holders
-	// use a second holding variable called PayoutBalance to do 
-	// the actual payout from b/c too much gas to iterate thru 
-	// each payee. Only start a new run at most once per "minpayinterval".
-	// Its done in runs of "_numPays"
-	// we use special coding for the holderAccounts to avoid a hack
-	// of getting paid at the top of the list then transfering tokens
-	// to another address at the bottom of the list.
-	// because of that each holderAccounts entry gets the payoutid stamped upon it (top two bytes)
-	// also a token transfer will transfer the payout id.
-	// ---------------------------------------------------
-	function doPayout(uint _numPays)  internal
-	{
-		if (totalTokensMinted == 0)
-			return;
-
-		if ((holdoverBalance > 0) 
-			&& (payoutBalance == 0)
-			&& (now > (lastPayoutTime+minPayInterval))) {
-			// start a new run
-			curPayoutId++;
-			if (curPayoutId >= 32768)
-				curPayoutId = 1;
-			lastPayoutTime = now;
-			payoutBalance = int(holdoverBalance);
-			prOrigPayoutBal = payoutBalance;
-			prOrigTokensMint = totalTokensMinted;
-			holdoverBalance = 0;
-			lastPayoutIndex = 0;
-			StatEventI("StartRun", uint(curPayoutId));
-		} else if (payoutBalance > 0) {
-			// work down the p.o.b
-			uint nAmount;
-			uint nPerTokDistrib = uint(prOrigPayoutBal)/prOrigTokensMint;
-			uint paids = 0;
-			uint i; // intentional
-			for (i = lastPayoutIndex; (paids < _numPays) && (i < numAccounts) && (payoutBalance > 0); i++ ) {
-				address a = holderIndexes[i];
-				if (a == address(0)) {
-					continue;
-				}
-				var (pid, held) = getPayIdAndHeld(holderAccounts[a].tokens);
-				if ((held > 0) && (pid != curPayoutId)) {
-					nAmount = nPerTokDistrib * held;
-					if (int(nAmount) <= payoutBalance){
-						holderAccounts[a].balance += nAmount; 
-						holderAccounts[a].tokens = (curPayoutId * (2 ** 48)) | held;
-						payoutBalance -= int(nAmount);					
-						paids++;
-					}
-				}
-			}
-			lastPayoutIndex = i;
-			if (lastPayoutIndex >= numAccounts || payoutBalance <= 0) {
-				lastPayoutIndex = 0;
-				if (payoutBalance > 0)
-					holdoverBalance += uint(payoutBalance);// put back any leftovers
-				payoutBalance = 0;
-				StatEventI("RunComplete", uint(prOrigPayoutBal) );
-
-			} else {
-				StatEventI("PayRun", paids );
-			}
-		}
-		
-	}
-
 
 	// ----------------------------
 	// sender withdraw entire rewards/dividends
 	// ----------------------------
 	function withdrawDividends() public returns (uint _amount)
 	{
-		if (holderAccounts[msg.sender].balance == 0) { 
-			//_amount = 0;
-			StatEvent("0 Balance");
+		calcCurPointsForAcct(msg.sender);
+
+                _amount = holderAccounts[msg.sender].currentPoints / NewTokenSupply;
+		if (_amount <= payoutThreshold) {
+			StatEventI("low Balance", _amount);
 			return;
 		} else {
 			if ((msg.sender == developers) 
 				&&  (now < vestTime)) {
-				//statEvent("Tokens not yet vested.");
-				//_amount = 0;
+				StatEvent("Tokens not yet vested.");
+				_amount = 0;
 				return;
 			}
 
-			_amount = holderAccounts[msg.sender].balance; 
-			holderAccounts[msg.sender].balance = 0; 
+			//FOR DEBUG ONLY
+			if (_amount > this.balance) { // should never be here
+				StatEvent("Balance Error!");
+				return;
+			}
+
+			holderAccounts[msg.sender].currentPoints = 0;
+			holdoverBalance -= _amount;
 			if (!msg.sender.call.gas(rwGas).value(_amount)())
 				throw;
-			//StatEventI("Paid", _amount);
-	
 		}
-
 	}
+
+	// ----------------------------
+	// allow sender to transfer dividends
+	// ----------------------------
+	function transferDividends(address _to) returns (bool success) 
+	{
+		if ((msg.sender == developers) 
+			&&  (now < vestTime)) {
+			//statEvent("Tokens not yet vested.");
+			return false;
+		}
+		calcCurPointsForAcct(msg.sender);
+	        if (holderAccounts[msg.sender].currentPoints == 0) {
+			statEvent("Zero balance");
+			return false;
+		}
+		if (!holderAccounts[_to].alloced) {
+			addAccount(_to);
+		}
+		holderAccounts[_to].lastSnapShot = totalFundsReceived;
+		holderAccounts[_to].currentPoints = holderAccounts[msg.sender].currentPoints;
+		holderAccounts[msg.sender].currentPoints = 0;
+		StatEvent("Trasnfered Dividends");
+	        return true;
+    	}
+
+
 
 	// ----------------------------
 	// set gas for operations
 	// ----------------------------
-	function setOpGas(uint _rm, uint _rf, uint _rw)
+	function setOpGas(uint _rw, uint _optIn)
 	{
 		if (msg.sender != owner && msg.sender != developers) {
 			//StatEvent("only owner calls");
 			return;
 		} else {
-			rmGas = _rm;
-			rfGas = _rf;
 			rwGas = _rw;
+			optInGas = _optIn;
 		}
 	}
 
-	// ----------------------------
-	// get gas for operations
-	// ----------------------------
-	function getOpGas() constant returns (uint _rm, uint _rf, uint _rw)
-	{
-		_rm = rmGas;
-		_rf = rfGas;
-		_rw = rwGas;
-	}
- 
 
 	// ----------------------------
 	// check rewards.  pass in address of token holder
 	// ----------------------------
 	function checkDividends(address _addr) constant returns(uint _amount)
 	{
-		if (holderAccounts[_addr].alloced)
-			_amount = holderAccounts[_addr].balance;
-	}		
+		if (holderAccounts[_addr].alloced) {
+		   //don't call calcCurPointsForAcct here, cuz this is a constant fcn
+		   uint _currentPoints = holderAccounts[_addr].currentPoints + 
+			((TotalFeesReceived - holderAccounts[_addr].lastSnapshot) * holderAccounts[_addr].tokens);
+    		   _amount = _currentPoints / NewTokenSupply;
 
-
-	// ------------------------------------------------
-	// icoCheckup - check up call for administrators
-	// after sale is closed if min ico tokens sold, 10 percent will be distributed to 
-	// company to cover various operating expenses
-	// after sale and usage dealines have been met, remaining 90 percent will be distributed to
-	// company.
-	// ------------------------------------------------
-	function icoCheckup() public
-	{
-		if (msg.sender != owner && msg.sender != developers)
-			throw;
-
-		uint nmsgmask;
-		//nmsgmask = 0;
-	
-		if (icoStatus == IcoStatusValue.saleClosed) {
-			if ((getNumTokensPurchased() >= minIcoTokenGoal)
-				&& (remunerationStage == 0 )) {
-				remunerationStage = 1;
-				remunerationBalance = (totalTokenFundsReceived/100)*9; // 9 percent
-				auxPartnerBalance =  (totalTokenFundsReceived/100); // 1 percent
-				nmsgmask |= 1;
-			} 
-		}
-		if (icoStatus == IcoStatusValue.succeeded) {
-		
-			if (remunerationStage == 0 ) {
-				remunerationStage = 1;
-				remunerationBalance = (totalTokenFundsReceived/100)*9; 
-				auxPartnerBalance =  (totalTokenFundsReceived/100);
-				nmsgmask |= 4;
-			}
-			if (remunerationStage == 1) { // we have already suceeded
-				remunerationStage = 2;
-				remunerationBalance += totalTokenFundsReceived - (totalTokenFundsReceived/10); // 90 percent
-				nmsgmask |= 8;
-			}
+		// low balance? let him see it -Etansky
+		  // if (_amount <= payoutThreshold) {
+		  //	_amount = 0;
+		  // }
 
 		}
-
-		uint ntmp;
-
-		if (remunerationBalance > 0) { 
-		// only pay one entity per call, dont want to run out of gas
-				ntmp = remunerationBalance;
-				remunerationBalance = 0;
-				if (!founderOrg.call.gas(rmGas).value(ntmp)()) {
-					remunerationBalance = ntmp;
-					nmsgmask |= 32;
-				} else {
-					nmsgmask |= 64;
-				}	
-		} else 	if (auxPartnerBalance > 0) {
-		// note the "else" only pay one entity per call, dont want to run out of gas
-			ntmp = auxPartnerBalance;
-			auxPartnerBalance = 0;
-			if (!auxPartner.call.gas(rmGas).value(ntmp)()) {
-				auxPartnerBalance = ntmp;
-				nmsgmask |= 128;
-			}  else {
-				nmsgmask |= 256;
-			}
-
-		} 
-		
-		StatEventI("ico-checkup", nmsgmask);
 	}
+
 
 
 	// ----------------------------
@@ -765,14 +460,13 @@ contract E4Token is Token, E4RowRewards {
 		if (msg.sender != owner
 			|| settingsState == SettingStateValue.lockedRelease)
 			 throw;
-
 		owner = _addr;
 	}
 
 	// ----------------------------
-	// swap developers account
+	// set developers account
 	// ----------------------------
-	function changeDevevoperAccont(address _addr) 
+	function setDeveloper(address _addr) 
 	{
 		if (msg.sender != owner
 			|| settingsState == SettingStateValue.lockedRelease)
@@ -781,26 +475,17 @@ contract E4Token is Token, E4RowRewards {
 	}
 
 	// ----------------------------
-	// change founder
+	// set oldE4 Addresses
 	// ----------------------------
-	function changeFounder(address _addr) 
+	function setOldE4(address _oldE4, address _oldE4Recyle) 
 	{
 		if (msg.sender != owner
 			|| settingsState == SettingStateValue.lockedRelease)
 			 throw;
-		founderOrg = _addr;
+		oldE4 = _oldE4;
+		oldE4RecycleBin = _oldE4Recyle;
 	}
 
-	// ----------------------------
-	// change auxPartner
-	// ----------------------------
-	function changeAuxPartner(address _aux) 
-	{
-		if (msg.sender != owner
-			|| settingsState == SettingStateValue.lockedRelease)
-			 throw;
-		auxPartner = _aux;
-	}
 
 
 	// ----------------------------
@@ -815,57 +500,66 @@ contract E4Token is Token, E4RowRewards {
 		suicide(developers);
 	}
 
-	// ----------------------------
-	// get all ico status, funding and usage info
-	// ----------------------------
-	function getIcoInfo() constant returns(IcoStatusValue _status, uint _saleStart, uint _saleEnd, uint _usageEnd, uint _saleGoal, uint _usageGoal, uint _sold, uint _used, uint _funds, uint _credits, uint _remuStage, uint _vest)
-	{
-		_status = icoStatus;
-		_saleStart = fundingStart;
-		_saleEnd = fundingDeadline;
-		_usageEnd = usageDeadline;
-		_vest = vestTime;
-		_saleGoal = minIcoTokenGoal;
-		_usageGoal = minUsageGoal;
-		_sold = getNumTokensPurchased();
-		_used = getNumGames();
-		_funds = totalTokenFundsReceived;
-		_credits = partnerCredits;
-		_remuStage = remunerationStage;
-	}
 
 	// ----------------------------
-	// NOTE! CALL AT THE RISK OF RUNNING OUT OF GAS.
-	// ANYONE CAN CALL THIS FUNCTION BUT YOU HAVE TO SUPPLY 
-	// THE CORRECT AMOUNT OF GAS WHICH MAY DEPEND ON 
-	// THE _NUMPAYS PARAMETER.  WHICH MUST BE BETWEEN 1 AND 1000
-	// THE STANDARD VALUE IS STORED IN "maxPaysPer"
+	// OPT IN FROM CLASSIC.
+	// All old token holders can opt into this new contract by calling this function.
+	// This "transferFrom"s tokens from the old addresses to the new recycleBin address
+	// which is a new address set up on the old contract.  Afterwhich new tokens 
+	// are credited to the old holder.  Also the lastSnapShot is set to 0 then 
+	// calcCredited points are called setting up the new signatoree all of his 
+	// accrued dividends.
 	// ----------------------------
-	function flushDividends(uint _numPays)
+	function optInFromClassic() public
 	{
-		if ((_numPays == 0) || (_numPays > 1000)) {
-			StatEvent("Invalid.");
-		} else if (holdoverBalance > 0 || payoutBalance > 0) {
-			doPayout(_numPays);
-		} else {
-			StatEvent("Nothing to do.");
+		if (oldE4 == address(0)) {
+			StatEvent("config err");
+			return;
 		}
-				
-	}
-
-	function doDeveloperGrant() internal
-	{
-		if (!developersGranted) {
-			developersGranted = true;
-			numDevTokens = (totalTokensMinted * 15)/100;
-			totalTokensMinted += numDevTokens;
-			if (!holderAccounts[developers].alloced) 
-				addAccount(developers);
-			uint newHeld = getHeld(holderAccounts[developers].tokens) + numDevTokens;
-			holderAccounts[developers].tokens = newHeld |  (curPayoutId * (2 ** 48));
-
+		// 1. check balance of msg.sender in old contract.
+		address nrequester = msg.sender;
+		
+		// 2. make sure account not already allocd (in fact, it's ok if it's allocd, so long
+		// as it is empty now. the reason for this check is cuz we are going to credit him with
+		// dividends, according to his token count, from the begin of time.
+		if (holderAccounts[nrequester].tokens != 0) {
+			StatEvent("Account has already been allocd!");
+			return;
 		}
-	}
 
+		// 3. check his tok balance
+		Token iclassic = Token(oldE4);
+		uint _toks = iclassic.balanceOf(nrequester);
+		if (_toks == 0) {
+			StatEvent("Nothing to do");
+			return;
+		}
+
+		// must be 100 percent of holdings
+		if (iclassic.allowance(nrequester, address(this)) < _toks) {
+			StatEvent("Please approve this contract to transfer");
+			return;
+		}
+
+		// 4, transfer his old toks to recyle bin
+		iclassic.transferFrom.gas(optInGas)(nrequester, oldE4RecycleBin, _toks);
+
+		// todo, error check?
+		if (iclassic.balanceOf(nrequester) == 0) {
+			// success, add the account, set the tokens, set snapshot to zero
+			if (!holderAccounts[nrequester].alloced)
+				addAccount(nrequester);
+			holderAccounts[nrequester].tokens = _toks * NewTokensPerOrigToken;
+			holderAccounts[nrequester].lastSnapshot = 0;
+			calcCurPointsForAcct(nrequester);
+			numToksSwitchedOver += _toks;
+			// no need to decrement points from a "holding account"
+			// b/c there is no need to keep it.
+			StatEvent("Success Switched Over");
+		} else
+			StatEvent("Transfer Error! please contact Dev team!");
+
+
+	}
 
 }
