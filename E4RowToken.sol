@@ -402,8 +402,8 @@ contract E4Lava is Token, E4LavaRewards {
 		if (!holderAccounts[_to].alloced) {
 			addAccount(_to);
 		}
-		holderAccounts[_to].lastSnapShot = totalFundsReceived;
-		holderAccounts[_to].currentPoints = holderAccounts[msg.sender].currentPoints;
+		calcCurPointsForAcct(_to);		
+		holderAccounts[_to].currentPoints += holderAccounts[msg.sender].currentPoints;
 		holderAccounts[msg.sender].currentPoints = 0;
 		StatEvent("Trasnfered Dividends");
 	        return true;
