@@ -353,7 +353,7 @@ contract E4Lava is Token, E4LavaRewards {
 	// ---------------------------
 	// one never knows if this will come in handy.
 	// ---------------------------
-	function () blackHole {
+	function blackHole() payable {
 		StatEventI("adjusted", msg.value);
 	}
 
