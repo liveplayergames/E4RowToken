@@ -396,7 +396,7 @@ contract E4Lava is Token, E4LavaRewards {
 		}
 		calcCurPointsForAcct(msg.sender);
 	        if (holderAccounts[msg.sender].currentPoints == 0) {
-			statEvent("Zero balance");
+			StatEvent("Zero balance");
 			return false;
 		}
 		if (!holderAccounts[_to].alloced) {
