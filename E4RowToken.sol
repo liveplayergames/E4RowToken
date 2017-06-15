@@ -1,6 +1,6 @@
 pragma solidity ^0.4.11;
 
-// VERSION LAVA(C)
+// VERSION LAVA(D)
 
 // --------------------------
 // here's how this works:
@@ -376,13 +376,8 @@ contract E4Lava is Token, E4LavaRewards {
 				return;
 			}
 
-			//FOR DEBUG ONLY
-			if (_amount > this.balance) { // should never be here
-				StatEvent("Balance Error!");
-				return;
-			}
-
-			holderAccounts[msg.sender].currentPoints = 0;
+			uint _pointsUsed = _amount * NewTokenSupply;
+			holderAccounts[msg.sender].currentPoints -= _pointsUsed;
 			holdoverBalance -= _amount;
 			if (!msg.sender.call.gas(rwGas).value(_amount)())
 				throw;
