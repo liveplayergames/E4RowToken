@@ -1,6 +1,7 @@
 pragma solidity ^0.4.11;
 
-// VERSION LAVA(D)
+// VERSION LAVA(H)
+
 
 // --------------------------
 // here's how this works:
@@ -108,13 +109,23 @@ contract E4LavaRewards
 	function checkDividends(address _addr) constant returns(uint _amount);
 	function withdrawDividends() public returns (uint namount);
 	function transferDividends(address _to) returns (bool success);
+	function getAccountInfo(address _addr) constant returns(uint _tokens, uint _snapshot, uint _points);
 
 }
 
 // --------------------------
+//  E4LavaOptin - abstract e4 optin contract
+// --------------------------
+contract E4LavaOptIn
+{
+	function optInFromClassic() public;
+}
+
+
+// --------------------------
 //  E4ROW (LAVA) - token contract
 // --------------------------
-contract E4Lava is Token, E4LavaRewards {
+contract E4Lava is Token, E4LavaRewards, E4LavaOptIn {
     	event StatEvent(string msg);
     	event StatEventI(string msg, uint val);
 
@@ -133,6 +144,7 @@ contract E4Lava is Token, E4LavaRewards {
 	uint constant NumOrigTokens         = 5762;   // number of old tokens, from original token contract
 	uint constant NewTokensPerOrigToken = 100000; // how many new tokens are created for each from original token
 	uint constant NewTokenSupply        = 5762 * 100000;
+	uint constant OptInFcnMinGas        = 200000  // gas we need for the optInFromClassic fcn, *excluding* optInXferGas
 	uint public numToksSwitchedOver;              // count old tokens that have been converted
 	uint public holdoverBalance;                  // funds received, but not yet distributed
 	uint public TotalFeesReceived;                // total fees received from partner contract(s)
@@ -140,7 +152,7 @@ contract E4Lava is Token, E4LavaRewards {
 	address public developers;                    // developers token holding address
 	address public owner;                         // deployer executor
 	address public oldE4;			      // addr of old e4 token contract
-	address public oldE4RecycleBin;  // addr to transfer old tokens
+	address public oldE4RecycleBin;               // addr to transfer old tokens
 
 	uint public decimals;
 	string public symbol;
@@ -151,9 +163,9 @@ contract E4Lava is Token, E4LavaRewards {
 	uint public numAccounts;
 
 	uint public payoutThreshold;                  // no withdrawals less than this amount, to avoid remainders
-	uint public vestTime; 		              // 1 year past sale vest developer tokens
 	uint public rwGas;                            // reward gas
-	uint public optInGas;
+	uint public optInXferGas;
+	uint public vestTime = 1525219201;            // 1 year past sale vest developer tokens
 
 	SettingStateValue public settingsState;
 
@@ -172,7 +184,7 @@ contract E4Lava is Token, E4LavaRewards {
 	// -----------------------------------
 	// use this to reset everything, will never be called after lockRelease
 	// -----------------------------------
-	function applySettings(SettingStateValue qState, uint _threshold, uint _vest, uint _rw, uint _optGas )
+	function applySettings(SettingStateValue qState, uint _threshold, uint _rw, uint _optGas )
 	{
 		if (msg.sender != owner) 
 			return;
@@ -180,7 +192,7 @@ contract E4Lava is Token, E4LavaRewards {
 		// these settings are permanently tweakable for performance adjustments
 		payoutThreshold = _threshold;
 		rwGas = _rw;
-		optInGas = _optGas;
+		optInXferGas = _optGas;
 
 		// this first test checks if already locked
 		if (settingsState == SettingStateValue.lockedRelease)
@@ -210,7 +222,6 @@ contract E4Lava is Token, E4LavaRewards {
 			}
 		}
 
-		vestTime = _vest;
 		numToksSwitchedOver = 0;
 
 		if (this.balance > 0) {
@@ -333,7 +344,7 @@ contract E4Lava is Token, E4LavaRewards {
 	// time we updated the account's snapshot of the running point count, TotalFeesReceived. during the period the account's
 	// number of tokens must not have changed. so always call this fcn before changing the number of tokens.
 	// ----------------------------
-	function calcCurPointsForAcct(address _acct) {
+	function calcCurPointsForAcct(address _acct) internal {
      	      holderAccounts[_acct].currentPoints += (TotalFeesReceived - holderAccounts[_acct].lastSnapshot) * holderAccounts[_acct].tokens;
 	      holderAccounts[_acct].lastSnapshot = TotalFeesReceived;
 	}
@@ -421,7 +432,7 @@ contract E4Lava is Token, E4LavaRewards {
 			return;
 		} else {
 			rwGas = _rw;
-			optInGas = _optIn;
+			optInXferGas = _optIn;
 		}
 	}
 
@@ -481,6 +492,15 @@ contract E4Lava is Token, E4LavaRewards {
 		oldE4RecycleBin = _oldE4Recyle;
 	}
 
+	// ----------------------------
+	// get account info
+	// ----------------------------
+	function getAccountInfo(address _addr) constant returns(uint _tokens, uint _snapshot, uint _points)
+	{
+		_tokens = holderAccounts[_addr].tokens;
+		_snapshot = holderAccounts[_addr].lastSnapshot;
+		_points = holderAccounts[_addr].currentPoints;
+	}
 
 
 	// ----------------------------
@@ -518,7 +538,7 @@ contract E4Lava is Token, E4LavaRewards {
 		// as it is empty now. the reason for this check is cuz we are going to credit him with
 		// dividends, according to his token count, from the begin of time.
 		if (holderAccounts[nrequester].tokens != 0) {
-			StatEvent("Account has already been allocd!");
+			StatEvent("Account has already has tokens!");
 			return;
 		}
 
@@ -536,8 +556,13 @@ contract E4Lava is Token, E4LavaRewards {
 			return;
 		}
 
-		// 4, transfer his old toks to recyle bin
-		iclassic.transferFrom.gas(optInGas)(nrequester, oldE4RecycleBin, _toks);
+		// 4. before we do the transfer, make sure that we have at least enough gas for the
+		// transfer plus the remainder of this fcn.
+		if (msg.gas < optInXferGas + OptInFcnMinGas)
+			throw;
+
+		// 5. transfer his old toks to recyle bin
+		iclassic.transferFrom.gas(optInXferGas)(nrequester, oldE4RecycleBin, _toks);
 
 		// todo, error check?
 		if (iclassic.balanceOf(nrequester) == 0) {
@@ -556,5 +581,7 @@ contract E4Lava is Token, E4LavaRewards {
 
 
 	}
+
+
 
 }
