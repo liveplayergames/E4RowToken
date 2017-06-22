@@ -1,6 +1,6 @@
 pragma solidity ^0.4.11;
 
-// VERSION LAVA(I)
+// VERSION LAVA(J)
 
 
 // --------------------------
@@ -224,6 +224,8 @@ contract E4Lava is Token, E4LavaRewards, E4LavaOptIn {
 		}
 
 		numToksSwitchedOver = 0;
+		holdoverBalance = 0;
+		TotalFeesReceived = 0;
 
 		if (this.balance > 0) {
 			if (!owner.call.gas(rwGas).value(this.balance)())
